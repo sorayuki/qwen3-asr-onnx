@@ -1,0 +1,7 @@
+# onnx_asr_demo.py 的运行依赖。
+# 不建议在同一个环境里同时安装 onnxruntime / onnxruntime-gpu / onnxruntime-directml，
+# 除非你明确知道最终应该由哪个包提供 `import onnxruntime`。
+numpy==2.4.6
+onnxruntime-directml==1.24.4
+qwen-asr==0.0.6
+transformers==4.57.6
