@@ -1,5 +1,6 @@
 import argparse
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +40,9 @@ def parse_args():
     parser.add_argument("--context", default="")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--optimized", action="store_true", help="使用 *.optimized.onnx 模型。")
+    parser.add_argument("--benchmark", action="store_true", help="反复处理同一个音频，输出 warmup 后的吞吐。")
+    parser.add_argument("--benchmark-seconds", type=float, default=15.0, help="benchmark 至少运行多少秒。")
+    parser.add_argument("--warmup-runs", type=int, default=1, help="正式计时前完整跑几次预热。")
     parser.add_argument(
         "--provider",
         choices=["auto", "cpu", "directml", "cuda"],
@@ -206,6 +210,48 @@ def greedy_next_token(logits: np.ndarray) -> int:
     return int(np.argmax(logits[0, -1, :]))
 
 
+def load_runtime(model_dir: str, onnx_dir: str, optimized: bool, provider: str):
+    # 模型加载和 session 创建不计入 benchmark；吞吐只统计真正开始送入音频后的耗时。
+    processor = Qwen3ASRProcessor.from_pretrained(model_dir, fix_mistral_regex=True)
+    graphs = load_graphs(model_dir, onnx_dir, optimized=optimized, provider=provider)
+    return processor, graphs
+
+
+def audio_duration_seconds(processor: Qwen3ASRProcessor, wav: np.ndarray) -> float:
+    feature_extractor = getattr(processor, "feature_extractor", None)
+    sampling_rate = getattr(feature_extractor, "sampling_rate", 16000)
+    return float(len(wav)) / float(sampling_rate)
+
+
+def run_transcription(
+    processor: Qwen3ASRProcessor,
+    graphs: OnnxGraphs,
+    wav: np.ndarray,
+    context: str,
+    language: str | None,
+    max_new_tokens: int,
+):
+    prompt = build_prompt(processor, context=context, language=language)
+    inputs = prepare_inputs(processor, prompt, wav)
+    audio_embeddings = run_audio_encoder(graphs, inputs["input_features"], inputs["feature_attention_mask"])
+    text_embeddings = token_embed(graphs, inputs["input_ids"])
+    merged_embeddings = merge_audio_embeddings(inputs["input_ids"], text_embeddings, audio_embeddings)
+
+    generated_ids = generate(
+        graphs,
+        input_ids=inputs["input_ids"],
+        inputs_embeds=merged_embeddings,
+        attention_mask=inputs["attention_mask"],
+        max_new_tokens=max_new_tokens,
+    )
+    raw = processor.batch_decode(
+        [generated_ids],
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )[0]
+    return parse_asr_output(raw, user_language=language), raw
+
+
 def generate(
     graphs: OnnxGraphs,
     input_ids: np.ndarray,
@@ -277,37 +323,106 @@ def transcribe_onnx(
 
     # model_dir 只用于读取 tokenizer/processor/config 等小文件。
     # 这个 ONNX Runtime demo 不会读取 PyTorch 的 model.safetensors。
-    processor = Qwen3ASRProcessor.from_pretrained(model_dir, fix_mistral_regex=True)
-    graphs = load_graphs(model_dir, onnx_dir, optimized=optimized, provider=provider)
+    processor, graphs = load_runtime(model_dir, onnx_dir, optimized=optimized, provider=provider)
     print(f"ORT providers: {ort.get_available_providers()}")
     print(f"Using providers: {graphs.decoder.get_providers()}")
     print("Decoder mode: merged If decoder")
     wav = normalize_audios(audio)[0]
 
-    prompt = build_prompt(processor, context=context, language=language)
-    inputs = prepare_inputs(processor, prompt, wav)
-    audio_embeddings = run_audio_encoder(graphs, inputs["input_features"], inputs["feature_attention_mask"])
-    text_embeddings = token_embed(graphs, inputs["input_ids"])
-    merged_embeddings = merge_audio_embeddings(inputs["input_ids"], text_embeddings, audio_embeddings)
-
-    generated_ids = generate(
+    (parsed_language, text), raw = run_transcription(
+        processor,
         graphs,
-        input_ids=inputs["input_ids"],
-        inputs_embeds=merged_embeddings,
-        attention_mask=inputs["attention_mask"],
+        wav,
+        context=context,
+        language=language,
         max_new_tokens=max_new_tokens,
     )
-    raw = processor.batch_decode(
-        [generated_ids],
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )[0]
-    parsed_language, text = parse_asr_output(raw, user_language=language)
     return parsed_language, text, raw
+
+
+def benchmark_onnx(
+    model_dir: str,
+    onnx_dir: str,
+    audio,
+    context: str = "",
+    language: str | None = None,
+    max_new_tokens: int = 256,
+    optimized: bool = False,
+    provider: str = "auto",
+    benchmark_seconds: float = 15.0,
+    warmup_runs: int = 1,
+):
+    if language:
+        language = normalize_language_name(language)
+        validate_language(language)
+
+    processor, graphs = load_runtime(model_dir, onnx_dir, optimized=optimized, provider=provider)
+    print(f"ORT providers: {ort.get_available_providers()}")
+    print(f"Using providers: {graphs.decoder.get_providers()}")
+    print("Decoder mode: merged If decoder")
+
+    wav = normalize_audios(audio)[0]
+    audio_seconds = audio_duration_seconds(processor, wav)
+    if audio_seconds <= 0:
+        raise ValueError("audio duration must be greater than zero")
+
+    warmup_runs = max(0, warmup_runs)
+    benchmark_seconds = max(0.0, benchmark_seconds)
+
+    print(f"Audio duration: {audio_seconds:.3f} s")
+    print(f"Warmup runs: {warmup_runs}")
+    for _ in range(warmup_runs):
+        run_transcription(
+            processor,
+            graphs,
+            wav,
+            context=context,
+            language=language,
+            max_new_tokens=max_new_tokens,
+        )
+
+    # 从这里开始才计入吞吐：模型加载、音频读取/normalize、warmup 都已完成。
+    runs = 0
+    processed_audio_seconds = 0.0
+    start = time.perf_counter()
+    elapsed = 0.0
+    while elapsed < benchmark_seconds or runs == 0:
+        run_transcription(
+            processor,
+            graphs,
+            wav,
+            context=context,
+            language=language,
+            max_new_tokens=max_new_tokens,
+        )
+        runs += 1
+        processed_audio_seconds += audio_seconds
+        elapsed = time.perf_counter() - start
+
+    audio_seconds_per_second = processed_audio_seconds / elapsed
+    print(f"Benchmark wall time: {elapsed:.3f} s")
+    print(f"Benchmark runs: {runs}")
+    print(f"Processed audio: {processed_audio_seconds:.3f} s")
+    print(f"Audio seconds / second: {audio_seconds_per_second:.3f}x")
 
 
 def main():
     args = parse_args()
+    if args.benchmark:
+        benchmark_onnx(
+            model_dir=args.model_dir,
+            onnx_dir=args.onnx_dir,
+            audio=args.audio,
+            context=args.context,
+            language=args.language,
+            max_new_tokens=args.max_new_tokens,
+            optimized=args.optimized,
+            provider=args.provider,
+            benchmark_seconds=args.benchmark_seconds,
+            warmup_runs=args.warmup_runs,
+        )
+        return
+
     language, text, raw = transcribe_onnx(
         model_dir=args.model_dir,
         onnx_dir=args.onnx_dir,
