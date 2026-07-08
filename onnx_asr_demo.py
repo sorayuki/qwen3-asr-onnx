@@ -1,4 +1,5 @@
 import argparse
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,11 +45,6 @@ def parse_args():
         default="auto",
         help="ONNX Runtime 执行后端偏好。",
     )
-    parser.add_argument(
-        "--single-decoder",
-        action="store_true",
-        help="首轮也用 decoder_with_past 加空 past，不加载 decoder_init。",
-    )
     return parser.parse_args()
 
 
@@ -56,8 +52,12 @@ def parse_args():
 class OnnxGraphs:
     token_embed: ort.InferenceSession
     audio_encoder: ort.InferenceSession
-    decoder_init: ort.InferenceSession | None
-    decoder_with_past: ort.InferenceSession
+    # decoder_merged.onnx 内部用 If(use_past) 在 prefill 和 decode 两条快路径之间切换。
+    # 运行时只创建这一个 decoder session，避免重复加载 decoder 权重。
+    decoder: ort.InferenceSession
+    num_layers: int
+    num_kv_heads: int
+    head_dim: int
 
 
 def provider_list(provider: str):
@@ -89,18 +89,29 @@ def onnx_name(onnx_dir: Path, stem: str, optimized: bool) -> Path:
     return onnx_dir / f"{stem}{suffix}"
 
 
-def load_graphs(onnx_dir: str, optimized: bool, provider: str, single_decoder: bool) -> OnnxGraphs:
+def decoder_cache_config(model_dir: str) -> tuple[int, int, int]:
+    # merged decoder 的公开输入包含 past_key/value。首轮 prefill 虽然不使用 past，
+    # 但 ORT 仍要求 feed 所有公开输入，所以这里从轻量 config 读取空 KV 的 shape。
+    with open(Path(model_dir) / "config.json", "r", encoding="utf-8") as file:
+        config = json.load(file)
+    text_config = config["thinker_config"]["text_config"]
+    return (
+        int(text_config["num_hidden_layers"]),
+        int(text_config["num_key_value_heads"]),
+        int(text_config["head_dim"]),
+    )
+
+
+def load_graphs(model_dir: str, onnx_dir: str, optimized: bool, provider: str) -> OnnxGraphs:
     root = Path(onnx_dir)
-    # single-decoder 模式下，首轮 prefill 也调用 decoder_with_past，
-    # 只需要传入长度为 0 的 past_key/value。这样可以少加载一整份 decoder 权重，
-    # 代价是部分 provider 上首轮会更慢。
+    num_layers, num_kv_heads, head_dim = decoder_cache_config(model_dir)
     return OnnxGraphs(
         token_embed=make_session(onnx_name(root, "token_embed", optimized), provider),
         audio_encoder=make_session(onnx_name(root, "audio_encoder", optimized), provider),
-        decoder_init=None
-        if single_decoder
-        else make_session(onnx_name(root, "decoder_init", optimized), provider),
-        decoder_with_past=make_session(onnx_name(root, "decoder_with_past", optimized), provider),
+        decoder=make_session(onnx_name(root, "decoder_merged", optimized), provider),
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
     )
 
 
@@ -183,6 +194,14 @@ def output_map(session: ort.InferenceSession, values: list[np.ndarray]) -> dict[
     return {out.name: value for out, value in zip(session.get_outputs(), values)}
 
 
+def add_empty_past_feeds(graphs: OnnxGraphs, feeds: dict[str, np.ndarray]):
+    # use_past=False 会走 If 的 decoder_init 分支，这些空 past 不参与计算；
+    # 它们只是为了满足 merged graph 的统一输入签名。
+    for i in range(graphs.num_layers):
+        feeds[f"past_key_{i}"] = np.empty((1, graphs.num_kv_heads, 0, graphs.head_dim), dtype=np.float16)
+        feeds[f"past_value_{i}"] = np.empty((1, graphs.num_kv_heads, 0, graphs.head_dim), dtype=np.float16)
+
+
 def greedy_next_token(logits: np.ndarray) -> int:
     return int(np.argmax(logits[0, -1, :]))
 
@@ -195,29 +214,17 @@ def generate(
     max_new_tokens: int,
 ) -> list[int]:
     position_ids = position_ids_from_attention(attention_mask)
-    if graphs.decoder_init is None:
-        # 用空 cache 让 decoder_with_past 执行首轮 prefill。
-        # 这个导出的图已经验证可以接受 [batch, kv_heads, 0, head_dim]。
-        feeds = {
-            "inputs_embeds": inputs_embeds,
-            "position_ids": position_ids,
-            "attention_mask": attention_mask,
-        }
-        for i in range(28):
-            feeds[f"past_key_{i}"] = np.empty((1, 8, 0, 128), dtype=np.float16)
-            feeds[f"past_value_{i}"] = np.empty((1, 8, 0, 128), dtype=np.float16)
-        init_outputs = graphs.decoder_with_past.run(None, feeds)
-        current = output_map(graphs.decoder_with_past, init_outputs)
-    else:
-        init_outputs = graphs.decoder_init.run(
-            None,
-            {
-                "inputs_embeds": inputs_embeds,
-                "position_ids": position_ids,
-                "attention_mask": attention_mask,
-            },
-        )
-        current = output_map(graphs.decoder_init, init_outputs)
+    # 首轮 prefill：use_past=False 让 merged decoder 走原 decoder_init 快路径。
+    # 这避免了 single-decoder 空 cache prefill 的慢路径，同时仍只加载一份 decoder 权重。
+    feeds = {
+        "use_past": np.array(False, dtype=np.bool_),
+        "inputs_embeds": inputs_embeds,
+        "position_ids": position_ids,
+        "attention_mask": attention_mask,
+    }
+    add_empty_past_feeds(graphs, feeds)
+    init_outputs = graphs.decoder.run(None, feeds)
+    current = output_map(graphs.decoder, init_outputs)
     next_id = greedy_next_token(current["logits"])
     generated = []
 
@@ -231,7 +238,10 @@ def generate(
         attention_mask = np.concatenate([attention_mask, np.ones((1, 1), dtype=np.int64)], axis=1)
         step_pos = np.full((3, 1, 1), attention_mask.shape[1] - 1, dtype=np.int64)
 
+        # 后续 token：use_past=True 走原 decoder_with_past 快路径，并把上一轮
+        # present_key/value 改名成下一轮的 past_key/value。
         feeds = {
+            "use_past": np.array(True, dtype=np.bool_),
             "inputs_embeds": next_embeds,
             "position_ids": step_pos,
             "attention_mask": attention_mask,
@@ -244,8 +254,8 @@ def generate(
             elif name.startswith("present_value_"):
                 feeds[name.replace("present_", "past_")] = value
 
-        step_outputs = graphs.decoder_with_past.run(None, feeds)
-        current = output_map(graphs.decoder_with_past, step_outputs)
+        step_outputs = graphs.decoder.run(None, feeds)
+        current = output_map(graphs.decoder, step_outputs)
         next_id = greedy_next_token(current["logits"])
 
     return generated
@@ -260,7 +270,6 @@ def transcribe_onnx(
     max_new_tokens: int = 256,
     optimized: bool = False,
     provider: str = "auto",
-    single_decoder: bool = False,
 ):
     if language:
         language = normalize_language_name(language)
@@ -269,10 +278,10 @@ def transcribe_onnx(
     # model_dir 只用于读取 tokenizer/processor/config 等小文件。
     # 这个 ONNX Runtime demo 不会读取 PyTorch 的 model.safetensors。
     processor = Qwen3ASRProcessor.from_pretrained(model_dir, fix_mistral_regex=True)
-    graphs = load_graphs(onnx_dir, optimized=optimized, provider=provider, single_decoder=single_decoder)
+    graphs = load_graphs(model_dir, onnx_dir, optimized=optimized, provider=provider)
     print(f"ORT providers: {ort.get_available_providers()}")
-    print(f"Using providers: {graphs.decoder_with_past.get_providers()}")
-    print(f"Decoder mode: {'single decoder_with_past' if single_decoder else 'decoder_init + decoder_with_past'}")
+    print(f"Using providers: {graphs.decoder.get_providers()}")
+    print("Decoder mode: merged If decoder")
     wav = normalize_audios(audio)[0]
 
     prompt = build_prompt(processor, context=context, language=language)
@@ -308,7 +317,6 @@ def main():
         max_new_tokens=args.max_new_tokens,
         optimized=args.optimized,
         provider=args.provider,
-        single_decoder=args.single_decoder,
     )
     print(f"Language: {language}")
     print(f"Text: {text}")
