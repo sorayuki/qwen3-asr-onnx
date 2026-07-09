@@ -40,12 +40,18 @@ def parse_args():
     parser.add_argument("--context", default="")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--optimized", action="store_true", help="使用 *.optimized.onnx 模型。")
+    parser.add_argument(
+        "--decoder-layout",
+        choices=["merged", "split"],
+        default="merged",
+        help="merged 使用 decoder_merged；split 使用 decoder_init + decoder_with_past 做性能对照。",
+    )
     parser.add_argument("--benchmark", action="store_true", help="反复处理同一个音频，输出 warmup 后的吞吐。")
     parser.add_argument("--benchmark-seconds", type=float, default=15.0, help="benchmark 至少运行多少秒。")
     parser.add_argument("--warmup-runs", type=int, default=1, help="正式计时前完整跑几次预热。")
     parser.add_argument(
         "--provider",
-        choices=["auto", "cpu", "directml", "cuda"],
+        choices=["auto", "cpu", "directml", "cuda", "tensorrt"],
         default="auto",
         help="ONNX Runtime 执行后端偏好。",
     )
@@ -58,16 +64,44 @@ class OnnxGraphs:
     audio_encoder: ort.InferenceSession
     # decoder_merged.onnx 内部用 If(use_past) 在 prefill 和 decode 两条快路径之间切换。
     # 运行时只创建这一个 decoder session，避免重复加载 decoder 权重。
-    decoder: ort.InferenceSession
+    decoder: ort.InferenceSession | None
+    decoder_init: ort.InferenceSession | None
+    decoder_with_past: ort.InferenceSession | None
+    decoder_layout: str
     num_layers: int
     num_kv_heads: int
     head_dim: int
 
 
+@dataclass
+class TimingStats:
+    runs: int = 0
+    total: float = 0.0
+    prepare_inputs: float = 0.0
+    audio_encoder: float = 0.0
+    prefill_token_embed: float = 0.0
+    merge_embeddings: float = 0.0
+    position_ids: float = 0.0
+    decoder_prefill: float = 0.0
+    decode_token_embed: float = 0.0
+    decode_decoder: float = 0.0
+    decode_misc: float = 0.0
+    batch_decode_parse: float = 0.0
+    decode_tokens: int = 0
+
+
+def add_elapsed(stats: TimingStats | None, name: str, start: float):
+    if stats is not None:
+        setattr(stats, name, getattr(stats, name) + time.perf_counter() - start)
+
+
 def provider_list(provider: str):
-    # 优先使用当前环境已注册的 CUDA，其次是 Windows 上的 DirectML，最后回退到 CPU。
+    # auto 优先使用当前环境已注册的 CUDA，其次是 Windows 上的 DirectML，最后回退到 CPU。
+    # TensorRT 首次构建 engine 可能很慢，且对动态图支持更挑剔，所以只在显式指定时启用。
     # 这里不会安装 provider，只从 ONNX Runtime 实际能看到的 provider 里选择。
     available = ort.get_available_providers()
+    if provider == "tensorrt" and "TensorrtExecutionProvider" in available:
+        return ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
     if provider == "cuda" and "CUDAExecutionProvider" in available:
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]
     if provider == "directml" and "DmlExecutionProvider" in available:
@@ -85,7 +119,14 @@ def make_session(path: Path, provider: str) -> ort.InferenceSession:
     # prompt 和 KV cache 都会使用动态长度。关闭 memory pattern 可以避免部分
     # execution provider 复用旧 shape 假设导致的问题。
     options.enable_mem_pattern = False
-    return ort.InferenceSession(str(path), sess_options=options, providers=provider_list(provider))
+    session = ort.InferenceSession(str(path), sess_options=options, providers=provider_list(provider))
+    if provider == "tensorrt" and "TensorrtExecutionProvider" not in session.get_providers():
+        raise RuntimeError(
+            "TensorrtExecutionProvider was requested but the session fell back to "
+            f"{session.get_providers()}. Install TensorRT runtime libraries and make sure "
+            "nvinfer_10.dll is on PATH."
+        )
+    return session
 
 
 def onnx_name(onnx_dir: Path, stem: str, optimized: bool) -> Path:
@@ -106,13 +147,30 @@ def decoder_cache_config(model_dir: str) -> tuple[int, int, int]:
     )
 
 
-def load_graphs(model_dir: str, onnx_dir: str, optimized: bool, provider: str) -> OnnxGraphs:
+def load_graphs(
+    model_dir: str,
+    onnx_dir: str,
+    optimized: bool,
+    provider: str,
+    decoder_layout: str,
+) -> OnnxGraphs:
     root = Path(onnx_dir)
     num_layers, num_kv_heads, head_dim = decoder_cache_config(model_dir)
+    decoder = None
+    decoder_init = None
+    decoder_with_past = None
+    if decoder_layout == "merged":
+        decoder = make_session(onnx_name(root, "decoder_merged", optimized), provider)
+    else:
+        decoder_init = make_session(onnx_name(root, "decoder_init", optimized), provider)
+        decoder_with_past = make_session(onnx_name(root, "decoder_with_past", optimized), provider)
     return OnnxGraphs(
         token_embed=make_session(onnx_name(root, "token_embed", optimized), provider),
         audio_encoder=make_session(onnx_name(root, "audio_encoder", optimized), provider),
-        decoder=make_session(onnx_name(root, "decoder_merged", optimized), provider),
+        decoder=decoder,
+        decoder_init=decoder_init,
+        decoder_with_past=decoder_with_past,
+        decoder_layout=decoder_layout,
         num_layers=num_layers,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
@@ -210,10 +268,22 @@ def greedy_next_token(logits: np.ndarray) -> int:
     return int(np.argmax(logits[0, -1, :]))
 
 
-def load_runtime(model_dir: str, onnx_dir: str, optimized: bool, provider: str):
+def load_runtime(
+    model_dir: str,
+    onnx_dir: str,
+    optimized: bool,
+    provider: str,
+    decoder_layout: str,
+):
     # 模型加载和 session 创建不计入 benchmark；吞吐只统计真正开始送入音频后的耗时。
     processor = Qwen3ASRProcessor.from_pretrained(model_dir, fix_mistral_regex=True)
-    graphs = load_graphs(model_dir, onnx_dir, optimized=optimized, provider=provider)
+    graphs = load_graphs(
+        model_dir,
+        onnx_dir,
+        optimized=optimized,
+        provider=provider,
+        decoder_layout=decoder_layout,
+    )
     return processor, graphs
 
 
@@ -223,6 +293,22 @@ def audio_duration_seconds(processor: Qwen3ASRProcessor, wav: np.ndarray) -> flo
     return float(len(wav)) / float(sampling_rate)
 
 
+def print_runtime_providers(graphs: OnnxGraphs):
+    print(f"Token embed providers: {graphs.token_embed.get_providers()}")
+    print(f"Audio encoder providers: {graphs.audio_encoder.get_providers()}")
+    if graphs.decoder_layout == "merged":
+        if graphs.decoder is None:
+            raise RuntimeError("merged decoder session is not loaded")
+        print(f"Decoder mode: merged If decoder")
+        print(f"Decoder providers: {graphs.decoder.get_providers()}")
+    else:
+        if graphs.decoder_init is None or graphs.decoder_with_past is None:
+            raise RuntimeError("split decoder sessions are not loaded")
+        print("Decoder mode: split decoder_init + decoder_with_past")
+        print(f"Decoder init providers: {graphs.decoder_init.get_providers()}")
+        print(f"Decoder step providers: {graphs.decoder_with_past.get_providers()}")
+
+
 def run_transcription(
     processor: Qwen3ASRProcessor,
     graphs: OnnxGraphs,
@@ -230,12 +316,26 @@ def run_transcription(
     context: str,
     language: str | None,
     max_new_tokens: int,
+    stats: TimingStats | None = None,
 ):
+    total_start = time.perf_counter()
+
+    stage_start = time.perf_counter()
     prompt = build_prompt(processor, context=context, language=language)
     inputs = prepare_inputs(processor, prompt, wav)
+    add_elapsed(stats, "prepare_inputs", stage_start)
+
+    stage_start = time.perf_counter()
     audio_embeddings = run_audio_encoder(graphs, inputs["input_features"], inputs["feature_attention_mask"])
+    add_elapsed(stats, "audio_encoder", stage_start)
+
+    stage_start = time.perf_counter()
     text_embeddings = token_embed(graphs, inputs["input_ids"])
+    add_elapsed(stats, "prefill_token_embed", stage_start)
+
+    stage_start = time.perf_counter()
     merged_embeddings = merge_audio_embeddings(inputs["input_ids"], text_embeddings, audio_embeddings)
+    add_elapsed(stats, "merge_embeddings", stage_start)
 
     generated_ids = generate(
         graphs,
@@ -243,13 +343,21 @@ def run_transcription(
         inputs_embeds=merged_embeddings,
         attention_mask=inputs["attention_mask"],
         max_new_tokens=max_new_tokens,
+        stats=stats,
     )
+    stage_start = time.perf_counter()
     raw = processor.batch_decode(
         [generated_ids],
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )[0]
-    return parse_asr_output(raw, user_language=language), raw
+    parsed = parse_asr_output(raw, user_language=language)
+    add_elapsed(stats, "batch_decode_parse", stage_start)
+
+    if stats is not None:
+        stats.runs += 1
+        stats.total += time.perf_counter() - total_start
+    return parsed, raw
 
 
 def generate(
@@ -258,40 +366,69 @@ def generate(
     inputs_embeds: np.ndarray,
     attention_mask: np.ndarray,
     max_new_tokens: int,
+    stats: TimingStats | None = None,
 ) -> list[int]:
+    stage_start = time.perf_counter()
     position_ids = position_ids_from_attention(attention_mask)
-    # 首轮 prefill：use_past=False 让 merged decoder 走原 decoder_init 快路径。
-    # 这避免了 single-decoder 空 cache prefill 的慢路径，同时仍只加载一份 decoder 权重。
+    add_elapsed(stats, "position_ids", stage_start)
+
     feeds = {
-        "use_past": np.array(False, dtype=np.bool_),
         "inputs_embeds": inputs_embeds,
         "position_ids": position_ids,
         "attention_mask": attention_mask,
     }
-    add_empty_past_feeds(graphs, feeds)
-    init_outputs = graphs.decoder.run(None, feeds)
-    current = output_map(graphs.decoder, init_outputs)
+    if graphs.decoder_layout == "merged":
+        # 首轮 prefill：use_past=False 让 merged decoder 走原 decoder_init 快路径。
+        # 这避免了 single-decoder 空 cache prefill 的慢路径，同时仍只加载一份 decoder 权重。
+        feeds["use_past"] = np.array(False, dtype=np.bool_)
+        add_empty_past_feeds(graphs, feeds)
+        prefill_session = graphs.decoder
+    else:
+        prefill_session = graphs.decoder_init
+    if prefill_session is None:
+        raise RuntimeError("prefill decoder session is not loaded")
+
+    stage_start = time.perf_counter()
+    init_outputs = prefill_session.run(None, feeds)
+    add_elapsed(stats, "decoder_prefill", stage_start)
+
+    stage_start = time.perf_counter()
+    current = output_map(prefill_session, init_outputs)
     next_id = greedy_next_token(current["logits"])
     generated = []
+    add_elapsed(stats, "decode_misc", stage_start)
 
     for _ in range(max_new_tokens):
         if next_id in EOS_TOKEN_IDS:
             break
         generated.append(next_id)
+        if stats is not None:
+            stats.decode_tokens += 1
 
         next_input_ids = np.array([[next_id]], dtype=np.int64)
+        stage_start = time.perf_counter()
         next_embeds = token_embed(graphs, next_input_ids)
+        add_elapsed(stats, "decode_token_embed", stage_start)
+
+        stage_start = time.perf_counter()
         attention_mask = np.concatenate([attention_mask, np.ones((1, 1), dtype=np.int64)], axis=1)
         step_pos = np.full((3, 1, 1), attention_mask.shape[1] - 1, dtype=np.int64)
 
         # 后续 token：use_past=True 走原 decoder_with_past 快路径，并把上一轮
         # present_key/value 改名成下一轮的 past_key/value。
         feeds = {
-            "use_past": np.array(True, dtype=np.bool_),
             "inputs_embeds": next_embeds,
             "position_ids": step_pos,
             "attention_mask": attention_mask,
         }
+        if graphs.decoder_layout == "merged":
+            feeds["use_past"] = np.array(True, dtype=np.bool_)
+            step_session = graphs.decoder
+        else:
+            step_session = graphs.decoder_with_past
+        if step_session is None:
+            raise RuntimeError("step decoder session is not loaded")
+
         # ONNX 里没有 Transformers 的 DynamicCache 对象，所以每层输出的
         # present_key/value 都要在宿主程序里改名后传回下一轮的 past_key/value。
         for name, value in current.items():
@@ -299,10 +436,16 @@ def generate(
                 feeds[name.replace("present_", "past_")] = value
             elif name.startswith("present_value_"):
                 feeds[name.replace("present_", "past_")] = value
+        add_elapsed(stats, "decode_misc", stage_start)
 
-        step_outputs = graphs.decoder.run(None, feeds)
-        current = output_map(graphs.decoder, step_outputs)
+        stage_start = time.perf_counter()
+        step_outputs = step_session.run(None, feeds)
+        add_elapsed(stats, "decode_decoder", stage_start)
+
+        stage_start = time.perf_counter()
+        current = output_map(step_session, step_outputs)
         next_id = greedy_next_token(current["logits"])
+        add_elapsed(stats, "decode_misc", stage_start)
 
     return generated
 
@@ -316,6 +459,7 @@ def transcribe_onnx(
     max_new_tokens: int = 256,
     optimized: bool = False,
     provider: str = "auto",
+    decoder_layout: str = "merged",
 ):
     if language:
         language = normalize_language_name(language)
@@ -323,10 +467,15 @@ def transcribe_onnx(
 
     # model_dir 只用于读取 tokenizer/processor/config 等小文件。
     # 这个 ONNX Runtime demo 不会读取 PyTorch 的 model.safetensors。
-    processor, graphs = load_runtime(model_dir, onnx_dir, optimized=optimized, provider=provider)
+    processor, graphs = load_runtime(
+        model_dir,
+        onnx_dir,
+        optimized=optimized,
+        provider=provider,
+        decoder_layout=decoder_layout,
+    )
     print(f"ORT providers: {ort.get_available_providers()}")
-    print(f"Using providers: {graphs.decoder.get_providers()}")
-    print("Decoder mode: merged If decoder")
+    print_runtime_providers(graphs)
     wav = normalize_audios(audio)[0]
 
     (parsed_language, text), raw = run_transcription(
@@ -349,6 +498,7 @@ def benchmark_onnx(
     max_new_tokens: int = 256,
     optimized: bool = False,
     provider: str = "auto",
+    decoder_layout: str = "merged",
     benchmark_seconds: float = 15.0,
     warmup_runs: int = 1,
 ):
@@ -356,10 +506,15 @@ def benchmark_onnx(
         language = normalize_language_name(language)
         validate_language(language)
 
-    processor, graphs = load_runtime(model_dir, onnx_dir, optimized=optimized, provider=provider)
+    processor, graphs = load_runtime(
+        model_dir,
+        onnx_dir,
+        optimized=optimized,
+        provider=provider,
+        decoder_layout=decoder_layout,
+    )
     print(f"ORT providers: {ort.get_available_providers()}")
-    print(f"Using providers: {graphs.decoder.get_providers()}")
-    print("Decoder mode: merged If decoder")
+    print_runtime_providers(graphs)
 
     wav = normalize_audios(audio)[0]
     audio_seconds = audio_duration_seconds(processor, wav)
@@ -384,6 +539,7 @@ def benchmark_onnx(
     # 从这里开始才计入吞吐：模型加载、音频读取/normalize、warmup 都已完成。
     runs = 0
     processed_audio_seconds = 0.0
+    timing_stats = TimingStats()
     start = time.perf_counter()
     elapsed = 0.0
     while elapsed < benchmark_seconds or runs == 0:
@@ -394,6 +550,7 @@ def benchmark_onnx(
             context=context,
             language=language,
             max_new_tokens=max_new_tokens,
+            stats=timing_stats,
         )
         runs += 1
         processed_audio_seconds += audio_seconds
@@ -404,6 +561,34 @@ def benchmark_onnx(
     print(f"Benchmark runs: {runs}")
     print(f"Processed audio: {processed_audio_seconds:.3f} s")
     print(f"Audio seconds / second: {audio_seconds_per_second:.3f}x")
+    print_timing_breakdown(timing_stats)
+
+
+def print_timing_breakdown(stats: TimingStats):
+    if stats.runs <= 0:
+        return
+
+    rows = [
+        ("prepare_inputs", stats.prepare_inputs),
+        ("audio_encoder", stats.audio_encoder),
+        ("prefill_token_embed", stats.prefill_token_embed),
+        ("merge_embeddings", stats.merge_embeddings),
+        ("position_ids", stats.position_ids),
+        ("decoder_prefill", stats.decoder_prefill),
+        ("decode_token_embed", stats.decode_token_embed),
+        ("decode_decoder", stats.decode_decoder),
+        ("decode_misc", stats.decode_misc),
+        ("batch_decode_parse", stats.batch_decode_parse),
+    ]
+    print("Timing breakdown after warmup:")
+    print(f"  total measured pipeline: {stats.total:.3f} s")
+    for name, seconds in rows:
+        percent = seconds / stats.total * 100.0 if stats.total > 0 else 0.0
+        per_run = seconds / stats.runs
+        print(f"  {name}: {seconds:.3f} s total, {per_run:.3f} s/run, {percent:.1f}%")
+    if stats.decode_tokens:
+        print(f"  decode tokens: {stats.decode_tokens} total, {stats.decode_tokens / stats.runs:.1f}/run")
+        print(f"  decode decoder: {stats.decode_decoder / stats.decode_tokens * 1000.0:.2f} ms/token")
 
 
 def main():
@@ -418,6 +603,7 @@ def main():
             max_new_tokens=args.max_new_tokens,
             optimized=args.optimized,
             provider=args.provider,
+            decoder_layout=args.decoder_layout,
             benchmark_seconds=args.benchmark_seconds,
             warmup_runs=args.warmup_runs,
         )
@@ -432,6 +618,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         optimized=args.optimized,
         provider=args.provider,
+        decoder_layout=args.decoder_layout,
     )
     print(f"Language: {language}")
     print(f"Text: {text}")

@@ -24,6 +24,11 @@ def parse_args():
     parser.add_argument("--prefill-len", type=int, default=16)
     parser.add_argument("--past-len", type=int, default=8)
     parser.add_argument("--skip-optimizer", action="store_true")
+    parser.add_argument(
+        "--keep-decoder-parts",
+        action="store_true",
+        help="保留 decoder_init / decoder_with_past，方便和 merged decoder 做性能对照。",
+    )
     return parser.parse_args()
 
 
@@ -439,13 +444,15 @@ def main():
     )
     exported.append(out_dir / "audio_encoder.onnx")
 
-    print("[export] decoder_init.tmp.onnx")
+    print("[export] decoder_init.onnx" if args.keep_decoder_parts else "[export] decoder_init.tmp.onnx")
     inputs_embeds = torch.randn((1, args.prefill_len, hidden_size), dtype=dtype, device=device)
     position_ids = torch.arange(args.prefill_len, dtype=torch.long, device=device).view(1, 1, -1).expand(3, 1, -1)
     attention_mask = torch.ones((1, args.prefill_len), dtype=torch.long, device=device)
     kv_names = [name for i in range(num_layers) for name in (f"present_key_{i}", f"present_value_{i}")]
-    decoder_init_path = out_dir / "decoder_init.tmp.onnx"
-    decoder_with_past_path = out_dir / "decoder_with_past.tmp.onnx"
+    decoder_init_path = out_dir / ("decoder_init.onnx" if args.keep_decoder_parts else "decoder_init.tmp.onnx")
+    decoder_with_past_path = out_dir / (
+        "decoder_with_past.onnx" if args.keep_decoder_parts else "decoder_with_past.tmp.onnx"
+    )
     decoder_merged_path = out_dir / "decoder_merged.onnx"
     dynamic = {
         "inputs_embeds": {1: "seq"},
@@ -465,7 +472,7 @@ def main():
         dynamic,
     )
 
-    print("[export] decoder_with_past.tmp.onnx")
+    print("[export] decoder_with_past.onnx" if args.keep_decoder_parts else "[export] decoder_with_past.tmp.onnx")
     step_embeds = torch.randn((1, 1, hidden_size), dtype=dtype, device=device)
     step_pos = torch.full((3, 1, 1), args.past_len, dtype=torch.long, device=device)
     step_mask = torch.ones((1, args.past_len + 1), dtype=torch.long, device=device)
@@ -529,11 +536,13 @@ def main():
                 optimized_with_past_path,
                 decoder_merged_path.with_name("decoder_merged.optimized.onnx"),
             )
-            remove_onnx_file_family(optimized_init_path)
-            remove_onnx_file_family(optimized_with_past_path)
+            if not args.keep_decoder_parts:
+                remove_onnx_file_family(optimized_init_path)
+                remove_onnx_file_family(optimized_with_past_path)
 
-    remove_onnx_file_family(decoder_init_path)
-    remove_onnx_file_family(decoder_with_past_path)
+    if not args.keep_decoder_parts:
+        remove_onnx_file_family(decoder_init_path)
+        remove_onnx_file_family(decoder_with_past_path)
 
     print("[done]")
     for path in sorted(path for path in out_dir.glob("*.onnx") if ".tmp" not in path.name):

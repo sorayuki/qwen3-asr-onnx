@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+
+# Local model/runtime artifacts
+Qwen3-ASR-0.6B/
+onnx_models/
+TensorRT*/
+third_party/
+trt_cache/
+nvinfer*.dll
+nvonnxparser*.dll
+
+# Local sample files
+*.wav
