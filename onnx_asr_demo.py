@@ -1,8 +1,76 @@
 import argparse
 import json
+import os
+import site
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+
+_DLL_DIRECTORY_HANDLES = []
+
+
+def add_local_dll_directories():
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+
+    roots = [Path.cwd(), Path(__file__).resolve().parent]
+    candidates = []
+    for root in roots:
+        candidates.extend(
+            [
+                root,
+                root / "third_party",
+            ]
+        )
+        third_party = root / "third_party"
+        if third_party.is_dir():
+            for child in third_party.iterdir():
+                candidates.extend(
+                    [
+                        child,
+                        child / "bin",
+                        child / "lib",
+                        child / "runtime" / "bin" / "intel64" / "Release",
+                    ]
+                )
+
+    try:
+        site_dirs = site.getsitepackages()
+    except Exception:
+        site_dirs = []
+    try:
+        site_dirs.append(site.getusersitepackages())
+    except Exception:
+        pass
+
+    for site_dir in site_dirs:
+        package_root = Path(site_dir)
+        candidates.extend(
+            [
+                package_root / "openvino" / "libs",
+                package_root / "openvino" / "lib",
+            ]
+        )
+
+    seen = set()
+    path_entries = []
+    for directory in candidates:
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not resolved.is_dir():
+            continue
+        seen.add(resolved)
+        _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(resolved)))
+        path_entries.append(str(resolved))
+
+    if path_entries:
+        os.environ["PATH"] = os.pathsep.join(path_entries + [os.environ.get("PATH", "")])
+
+
+add_local_dll_directories()
 
 import numpy as np
 import onnxruntime as ort
@@ -51,9 +119,14 @@ def parse_args():
     parser.add_argument("--warmup-runs", type=int, default=1, help="正式计时前完整跑几次预热。")
     parser.add_argument(
         "--provider",
-        choices=["auto", "cpu", "directml", "cuda", "tensorrt"],
+        choices=["auto", "cpu", "directml", "cuda", "tensorrt", "openvino"],
         default="auto",
         help="ONNX Runtime 执行后端偏好。",
+    )
+    parser.add_argument(
+        "--openvino-device",
+        default="GPU",
+        help='OpenVINO device_type，例如 "GPU"、"GPU.0"、"CPU"。',
     )
     return parser.parse_args()
 
@@ -95,11 +168,16 @@ def add_elapsed(stats: TimingStats | None, name: str, start: float):
         setattr(stats, name, getattr(stats, name) + time.perf_counter() - start)
 
 
-def provider_list(provider: str):
+def provider_list(provider: str, openvino_device: str = "GPU"):
     # auto 优先使用当前环境已注册的 CUDA，其次是 Windows 上的 DirectML，最后回退到 CPU。
     # TensorRT 首次构建 engine 可能很慢，且对动态图支持更挑剔，所以只在显式指定时启用。
     # 这里不会安装 provider，只从 ONNX Runtime 实际能看到的 provider 里选择。
     available = ort.get_available_providers()
+    if provider == "openvino" and "OpenVINOExecutionProvider" in available:
+        return [
+            ("OpenVINOExecutionProvider", {"device_type": openvino_device}),
+            "CPUExecutionProvider",
+        ]
     if provider == "tensorrt" and "TensorrtExecutionProvider" in available:
         return ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
     if provider == "cuda" and "CUDAExecutionProvider" in available:
@@ -114,12 +192,22 @@ def provider_list(provider: str):
     return ["CPUExecutionProvider"]
 
 
-def make_session(path: Path, provider: str) -> ort.InferenceSession:
+def make_session(path: Path, provider: str, openvino_device: str = "GPU") -> ort.InferenceSession:
     options = ort.SessionOptions()
     # prompt 和 KV cache 都会使用动态长度。关闭 memory pattern 可以避免部分
     # execution provider 复用旧 shape 假设导致的问题。
     options.enable_mem_pattern = False
-    session = ort.InferenceSession(str(path), sess_options=options, providers=provider_list(provider))
+    session = ort.InferenceSession(
+        str(path),
+        sess_options=options,
+        providers=provider_list(provider, openvino_device),
+    )
+    if provider == "openvino" and "OpenVINOExecutionProvider" not in session.get_providers():
+        raise RuntimeError(
+            "OpenVINOExecutionProvider was requested but the session fell back to "
+            f"{session.get_providers()}. Install OpenVINO runtime libraries and make sure "
+            "openvino.dll, tbb12.dll, and related plugin DLLs are on PATH."
+        )
     if provider == "tensorrt" and "TensorrtExecutionProvider" not in session.get_providers():
         raise RuntimeError(
             "TensorrtExecutionProvider was requested but the session fell back to "
@@ -153,6 +241,7 @@ def load_graphs(
     optimized: bool,
     provider: str,
     decoder_layout: str,
+    openvino_device: str = "GPU",
 ) -> OnnxGraphs:
     root = Path(onnx_dir)
     num_layers, num_kv_heads, head_dim = decoder_cache_config(model_dir)
@@ -160,13 +249,13 @@ def load_graphs(
     decoder_init = None
     decoder_with_past = None
     if decoder_layout == "merged":
-        decoder = make_session(onnx_name(root, "decoder_merged", optimized), provider)
+        decoder = make_session(onnx_name(root, "decoder_merged", optimized), provider, openvino_device)
     else:
-        decoder_init = make_session(onnx_name(root, "decoder_init", optimized), provider)
-        decoder_with_past = make_session(onnx_name(root, "decoder_with_past", optimized), provider)
+        decoder_init = make_session(onnx_name(root, "decoder_init", optimized), provider, openvino_device)
+        decoder_with_past = make_session(onnx_name(root, "decoder_with_past", optimized), provider, openvino_device)
     return OnnxGraphs(
-        token_embed=make_session(onnx_name(root, "token_embed", optimized), provider),
-        audio_encoder=make_session(onnx_name(root, "audio_encoder", optimized), provider),
+        token_embed=make_session(onnx_name(root, "token_embed", optimized), provider, openvino_device),
+        audio_encoder=make_session(onnx_name(root, "audio_encoder", optimized), provider, openvino_device),
         decoder=decoder,
         decoder_init=decoder_init,
         decoder_with_past=decoder_with_past,
@@ -274,6 +363,7 @@ def load_runtime(
     optimized: bool,
     provider: str,
     decoder_layout: str,
+    openvino_device: str = "GPU",
 ):
     # 模型加载和 session 创建不计入 benchmark；吞吐只统计真正开始送入音频后的耗时。
     processor = Qwen3ASRProcessor.from_pretrained(model_dir, fix_mistral_regex=True)
@@ -283,6 +373,7 @@ def load_runtime(
         optimized=optimized,
         provider=provider,
         decoder_layout=decoder_layout,
+        openvino_device=openvino_device,
     )
     return processor, graphs
 
@@ -460,6 +551,7 @@ def transcribe_onnx(
     optimized: bool = False,
     provider: str = "auto",
     decoder_layout: str = "merged",
+    openvino_device: str = "GPU",
 ):
     if language:
         language = normalize_language_name(language)
@@ -473,6 +565,7 @@ def transcribe_onnx(
         optimized=optimized,
         provider=provider,
         decoder_layout=decoder_layout,
+        openvino_device=openvino_device,
     )
     print(f"ORT providers: {ort.get_available_providers()}")
     print_runtime_providers(graphs)
@@ -499,6 +592,7 @@ def benchmark_onnx(
     optimized: bool = False,
     provider: str = "auto",
     decoder_layout: str = "merged",
+    openvino_device: str = "GPU",
     benchmark_seconds: float = 15.0,
     warmup_runs: int = 1,
 ):
@@ -512,6 +606,7 @@ def benchmark_onnx(
         optimized=optimized,
         provider=provider,
         decoder_layout=decoder_layout,
+        openvino_device=openvino_device,
     )
     print(f"ORT providers: {ort.get_available_providers()}")
     print_runtime_providers(graphs)
@@ -604,6 +699,7 @@ def main():
             optimized=args.optimized,
             provider=args.provider,
             decoder_layout=args.decoder_layout,
+            openvino_device=args.openvino_device,
             benchmark_seconds=args.benchmark_seconds,
             warmup_runs=args.warmup_runs,
         )
@@ -619,6 +715,7 @@ def main():
         optimized=args.optimized,
         provider=args.provider,
         decoder_layout=args.decoder_layout,
+        openvino_device=args.openvino_device,
     )
     print(f"Language: {language}")
     print(f"Text: {text}")
