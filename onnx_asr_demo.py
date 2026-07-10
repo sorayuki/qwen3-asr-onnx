@@ -11,9 +11,12 @@ _DLL_DIRECTORY_HANDLES = []
 
 
 def add_local_dll_directories():
+    # Windows 3.8+ 不再默认从 PATH 之外加载依赖 DLL。必须在 import
+    # onnxruntime 之前注册 OpenVINO/TensorRT 等 wheel 自带的运行库目录。
     if os.name != "nt" or not hasattr(os, "add_dll_directory"):
         return
 
+    # 同时支持源码目录旁的 third_party 布局和当前 Python 环境的 wheel 布局。
     roots = [Path.cwd(), Path(__file__).resolve().parent]
     candidates = []
     for root in roots:
@@ -54,6 +57,7 @@ def add_local_dll_directories():
             ]
         )
 
+    # os.add_dll_directory 返回的 handle 必须保持存活，否则目录会立即失效。
     seen = set()
     path_entries = []
     for directory in candidates:
@@ -68,6 +72,7 @@ def add_local_dll_directories():
         path_entries.append(str(resolved))
 
     if path_entries:
+        # 少数第三方 DLL 会继续依赖传统 PATH 搜索，所以两种机制都设置。
         os.environ["PATH"] = os.pathsep.join(path_entries + [os.environ.get("PATH", "")])
 
 
@@ -133,6 +138,12 @@ def parse_args():
         help='OpenVINO device_type，例如 "GPU"、"GPU.0"、"CPU"。',
     )
     parser.add_argument(
+        "--directml-device-id",
+        type=int,
+        default=0,
+        help="DirectML DXGI adapter id；多 GPU 机器可显式选择独显或集显。",
+    )
+    parser.add_argument(
         "--trt-max-seq-len",
         type=int,
         default=1024,
@@ -143,10 +154,10 @@ def parse_args():
 
 @dataclass
 class OnnxGraphs:
+    # 三种 decoder layout 共用一个容器；未参与当前 layout 的 session 保持 None。
     token_embed: ort.InferenceSession
     audio_encoder: ort.InferenceSession
-    # decoder_merged.onnx 内部用 If(use_past) 在 prefill 和 decode 两条快路径之间切换。
-    # 运行时只创建这一个 decoder session，避免重复加载 decoder 权重。
+    # merged 使用 decoder；single 使用 decoder_with_past；split 使用后两者。
     decoder: ort.InferenceSession | None
     decoder_init: ort.InferenceSession | None
     decoder_with_past: ort.InferenceSession | None
@@ -159,6 +170,7 @@ class OnnxGraphs:
 
 @dataclass
 class TimingStats:
+    # 所有字段累加多轮 benchmark 的 wall time，最后再按 runs/tokens 求平均。
     runs: int = 0
     total: float = 0.0
     prepare_inputs: float = 0.0
@@ -175,6 +187,7 @@ class TimingStats:
 
 
 def add_elapsed(stats: TimingStats | None, name: str, start: float):
+    # 正常转写传入 None，避免为了性能统计复制整套推理流程。
     if stats is not None:
         setattr(stats, name, getattr(stats, name) + time.perf_counter() - start)
 
@@ -187,10 +200,13 @@ def trt_shape_profile(
     hidden_size: int,
     max_seq_len: int,
 ) -> dict[str, str]:
+    # TensorRT 构建动态图 engine 必须知道每个动态输入的 min/opt/max shape。
+    # 这里的上限是部署约束，不使用模型理论上的 65536 最大位置长度。
     max_seq_len = max(2, max_seq_len)
     opt_seq_len = min(256, max_seq_len)
 
     if model_stem == "token_embed":
+        # token_embed 同时处理完整 prompt 和逐 token 输入。
         return {
             "trt_profile_min_shapes": "input_ids:1x1",
             "trt_profile_opt_shapes": f"input_ids:1x{opt_seq_len}",
@@ -198,6 +214,7 @@ def trt_shape_profile(
         }
 
     if model_stem == "decoder_init":
+        # split layout 的 prefill 图只有一个共同的 seq 动态维度。
         return {
             "trt_profile_min_shapes": (
                 f"inputs_embeds:1x1x{hidden_size},position_ids:3x1x1,attention_mask:1x1"
@@ -216,6 +233,7 @@ def trt_shape_profile(
         return {}
 
     def decoder_shapes(input_len: int, total_len: int, past_len: int) -> str:
+        # 每层 key/value 都是独立图输入，必须逐个写进 TensorRT profile。
         shapes = [
             f"inputs_embeds:1x{input_len}x{hidden_size}",
             f"position_ids:3x1x{input_len}",
@@ -242,6 +260,7 @@ def provider_list(
     provider: str,
     openvino_device: str = "GPU",
     *,
+    directml_device_id: int = 0,
     model_stem: str = "",
     trt_cache_dir: Path | None = None,
     trt_max_seq_len: int = 1024,
@@ -263,6 +282,8 @@ def provider_list(
         if trt_cache_dir is None:
             raise ValueError("trt_cache_dir is required for TensorRT")
         trt_cache_dir.mkdir(parents=True, exist_ok=True)
+        # engine/timing cache 缩短后续启动；LayerNorm 保留 FP32 是为避免
+        # 本模型强制全 FP16 后出现数值漂移和重复乱码。
         trt_options = {
             "trt_engine_cache_enable": True,
             "trt_engine_cache_path": str(trt_cache_dir.resolve()),
@@ -290,8 +311,14 @@ def provider_list(
     if provider == "cuda" and "CUDAExecutionProvider" in available:
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]
     if provider == "directml" and "DmlExecutionProvider" in available:
-        return ["DmlExecutionProvider", "CPUExecutionProvider"]
+        # DirectML 的 device_id 是 DXGI adapter 顺序，与 OpenVINO/NVIDIA
+        # 的设备编号没有对应关系。
+        return [
+            ("DmlExecutionProvider", {"device_id": directml_device_id}),
+            "CPUExecutionProvider",
+        ]
     if provider == "auto":
+        # auto 不隐式选择 TensorRT/OpenVINO：二者需要额外运行库或 profile 配置。
         if "CUDAExecutionProvider" in available:
             return ["CUDAExecutionProvider", "CPUExecutionProvider"]
         if "DmlExecutionProvider" in available:
@@ -304,6 +331,7 @@ def make_session(
     provider: str,
     openvino_device: str = "GPU",
     *,
+    directml_device_id: int = 0,
     trt_cache_dir: Path | None = None,
     trt_max_seq_len: int = 1024,
     num_layers: int = 0,
@@ -311,12 +339,16 @@ def make_session(
     head_dim: int = 0,
     hidden_size: int = 0,
 ) -> ort.InferenceSession:
+    # 每个子图单独建 session，便于为 TensorRT profile 和 DirectML adapter
+    # 传入与该图匹配的 provider options。
     options = ort.SessionOptions()
     # prompt 和 KV cache 都会使用动态长度。关闭 memory pattern 可以避免部分
     # execution provider 复用旧 shape 假设导致的问题。
     options.enable_mem_pattern = False
+    # optimized 与普通文件使用同一个逻辑 stem，便于选择对应 profile。
     model_stem = path.name.split(".", 1)[0]
-    print(f"Loading ONNX session: {path.name} ({provider})", flush=True)
+    provider_label = f"{provider}:{directml_device_id}" if provider == "directml" else provider
+    print(f"Loading ONNX session: {path.name} ({provider_label})", flush=True)
     started = time.perf_counter()
     session = ort.InferenceSession(
         str(path),
@@ -324,6 +356,7 @@ def make_session(
         providers=provider_list(
             provider,
             openvino_device,
+            directml_device_id=directml_device_id,
             model_stem=model_stem,
             trt_cache_dir=trt_cache_dir,
             trt_max_seq_len=trt_max_seq_len,
@@ -334,6 +367,7 @@ def make_session(
         ),
     )
     print(f"Loaded ONNX session: {path.name} in {time.perf_counter() - started:.2f}s", flush=True)
+    # 显式 provider 请求不允许静默退回 CPU，否则 benchmark 会产生误导。
     if provider == "openvino" and "OpenVINOExecutionProvider" not in session.get_providers():
         raise RuntimeError(
             "OpenVINOExecutionProvider was requested but the session fell back to "
@@ -350,6 +384,7 @@ def make_session(
 
 
 def onnx_name(onnx_dir: Path, stem: str, optimized: bool) -> Path:
+    # optimizer 会把大 initializer 继续保存在同名 .onnx.data 文件中。
     suffix = ".optimized.onnx" if optimized else ".onnx"
     return onnx_dir / f"{stem}{suffix}"
 
@@ -376,7 +411,10 @@ def load_graphs(
     decoder_layout: str,
     openvino_device: str = "GPU",
     trt_max_seq_len: int = 1024,
+    directml_device_id: int = 0,
 ) -> OnnxGraphs:
+    # decoder shape 和空 KV feed 必须来自 config，不能把 0.6B 的结构常量
+    # 散落硬编码在 session 加载与生成逻辑中。
     root = Path(onnx_dir)
     num_layers, num_kv_heads, head_dim, hidden_size = decoder_cache_config(model_dir)
     decoder = None
@@ -385,10 +423,12 @@ def load_graphs(
     trt_cache_dir = root / "trt_engine_cache"
 
     def load(stem: str, session_provider: str | None = None) -> ort.InferenceSession:
+        # TensorRT 模式下辅助图可单独覆写成 CUDA，而 decoder 仍走 TensorRT。
         return make_session(
             onnx_name(root, stem, optimized),
             session_provider or provider,
             openvino_device,
+            directml_device_id=directml_device_id,
             trt_cache_dir=trt_cache_dir,
             trt_max_seq_len=trt_max_seq_len,
             num_layers=num_layers,
@@ -398,6 +438,7 @@ def load_graphs(
         )
 
     if decoder_layout == "merged":
+        # TensorRT parser 不接受 merged 图中捕获外层输入的 If 子图。
         if provider == "tensorrt":
             raise ValueError("TensorRT does not support decoder_merged.onnx; use --decoder-layout single")
         decoder = load("decoder_merged")
@@ -448,6 +489,7 @@ def prepare_inputs(processor: Qwen3ASRProcessor, prompt: str, wav: np.ndarray):
 
 
 def audio_output_len(frame_len: int) -> int:
+    # 尾块补到 100 帧运行后，需要按模型下采样公式裁掉补零产生的输出。
     return int(_get_feat_extract_output_lengths(np.array([frame_len], dtype=np.int64))[0])
 
 
@@ -474,6 +516,7 @@ def run_audio_encoder(graphs: OnnxGraphs, input_features: np.ndarray, feature_at
 
 
 def token_embed(graphs: OnnxGraphs, input_ids: np.ndarray) -> np.ndarray:
+    # decoder ONNX 接收 embedding 而非 token id，因此 prefill/decode 都单独查表。
     return graphs.token_embed.run(None, {"input_ids": input_ids.astype(np.int64)})[0].astype(np.float16)
 
 
@@ -499,7 +542,63 @@ def position_ids_from_attention(attention_mask: np.ndarray) -> np.ndarray:
 
 
 def output_map(session: ort.InferenceSession, values: list[np.ndarray]) -> dict[str, np.ndarray]:
+    # 普通 session.run 只返回位置列表，统一转成与 I/O Binding 相同的名称映射。
     return {out.name: value for out, value in zip(session.get_outputs(), values)}
+
+
+def decoder_iobinding_device(session: ort.InferenceSession) -> tuple[str, int] | None:
+    # 只有公开了设备 allocator 的 EP 才能让动态 KV 输出留在设备上。
+    # OpenVINO 当前没有对应的 Python I/O Binding device type，继续走 CPU 路径。
+    providers = session.get_providers()
+    if "CUDAExecutionProvider" in providers and (
+        "TensorrtExecutionProvider" in providers or providers[0] == "CUDAExecutionProvider"
+    ):
+        return "cuda", 0
+    if providers[0] == "DmlExecutionProvider":
+        # The provider's device_id selects a DXGI adapter, but ORT registers
+        # that session's DML allocator as device 0 regardless of adapter id.
+        return "dml", 0
+    return None
+
+
+def run_decoder(
+    session: ort.InferenceSession,
+    cpu_feeds: dict[str, np.ndarray],
+    past_cache: dict[str, object] | None = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    output_device = decoder_iobinding_device(session)
+    if output_device is None:
+        # 兼容 CPU/OpenVINO 等 EP：cache 仍以 NumPy 输出并在下一轮重新 feed。
+        feeds = dict(cpu_feeds)
+        if past_cache:
+            for name, value in past_cache.items():
+                feeds[name.replace("present_", "past_")] = value
+        current = output_map(session, session.run(None, feeds))
+        logits = current.pop("logits")
+        return logits, current
+
+    # embedding/mask 很小，允许 ORT 从 CPU 上传；体积随序列增长的 KV cache
+    # 则始终以 OrtValue 在同一设备 allocator 中转发。
+    binding = session.io_binding()
+    for name, value in cpu_feeds.items():
+        binding.bind_cpu_input(name, value)
+    if past_cache:
+        for name, value in past_cache.items():
+            binding.bind_ortvalue_input(name.replace("present_", "past_"), value)
+
+    output_names = [output.name for output in session.get_outputs()]
+    for name in output_names:
+        # greedy 选 token 只需要 CPU logits；KV 输出留在 CUDA/DML 设备上，
+        # 下一轮通过 bind_ortvalue_input 直接复用。
+        if name == "logits":
+            binding.bind_output(name, "cpu")
+        else:
+            binding.bind_output(name, output_device[0], output_device[1])
+
+    session.run_with_iobinding(binding)
+    outputs = dict(zip(output_names, binding.get_outputs()))
+    logits = outputs.pop("logits").numpy()
+    return logits, outputs
 
 
 def add_empty_past_feeds(graphs: OnnxGraphs, feeds: dict[str, np.ndarray]):
@@ -511,6 +610,7 @@ def add_empty_past_feeds(graphs: OnnxGraphs, feeds: dict[str, np.ndarray]):
 
 
 def greedy_next_token(logits: np.ndarray) -> int:
+    # 模型导出保持 [batch, seq, vocab]，生成只读取最后一个位置。
     return int(np.argmax(logits[0, -1, :]))
 
 
@@ -522,6 +622,7 @@ def load_runtime(
     decoder_layout: str,
     openvino_device: str = "GPU",
     trt_max_seq_len: int = 1024,
+    directml_device_id: int = 0,
 ):
     # 模型加载和 session 创建不计入 benchmark；吞吐只统计真正开始送入音频后的耗时。
     processor = Qwen3ASRProcessor.from_pretrained(model_dir, fix_mistral_regex=True)
@@ -533,17 +634,21 @@ def load_runtime(
         decoder_layout=decoder_layout,
         openvino_device=openvino_device,
         trt_max_seq_len=trt_max_seq_len,
+        directml_device_id=directml_device_id,
     )
     return processor, graphs
 
 
 def audio_duration_seconds(processor: Qwen3ASRProcessor, wav: np.ndarray) -> float:
+    # 吞吐统一按输入音频秒数计算，而不是按 token 数或模型运行次数计算。
     feature_extractor = getattr(processor, "feature_extractor", None)
     sampling_rate = getattr(feature_extractor, "sampling_rate", 16000)
     return float(len(wav)) / float(sampling_rate)
 
 
 def print_runtime_providers(graphs: OnnxGraphs):
+    # 分 session 打印实际注册的 EP，避免把全局 available providers
+    # 误认为每个子图都使用了同一个后端。
     print(f"Token embed providers: {graphs.token_embed.get_providers()}")
     print(f"Audio encoder providers: {graphs.audio_encoder.get_providers()}")
     if graphs.decoder_layout == "merged":
@@ -562,6 +667,14 @@ def print_runtime_providers(graphs: OnnxGraphs):
             raise RuntimeError("single decoder session is not loaded")
         print("Decoder mode: single decoder_with_past")
         print(f"Decoder providers: {graphs.decoder_with_past.get_providers()}")
+    decoder_session = graphs.decoder if graphs.decoder_layout == "merged" else graphs.decoder_with_past
+    if decoder_session is not None:
+        binding_device = decoder_iobinding_device(decoder_session)
+        if binding_device is not None:
+            print(
+                f"Decoder KV cache: {binding_device[0].upper()} allocator:{binding_device[1]} "
+                "I/O binding (device-resident)"
+            )
 
 
 def run_transcription(
@@ -573,6 +686,8 @@ def run_transcription(
     max_new_tokens: int,
     stats: TimingStats | None = None,
 ):
+    # 一次完整转写按 prepare -> audio/text embedding -> decoder -> parse 组织；
+    # benchmark 复用此函数，保证计时路径和正常调用没有行为差异。
     total_start = time.perf_counter()
 
     stage_start = time.perf_counter()
@@ -592,6 +707,7 @@ def run_transcription(
     merged_embeddings = merge_audio_embeddings(inputs["input_ids"], text_embeddings, audio_embeddings)
     add_elapsed(stats, "merge_embeddings", stage_start)
 
+    # generate 内部负责 prefill、逐 token cache 转发和 EOS 停止。
     generated_ids = generate(
         graphs,
         input_ids=inputs["input_ids"],
@@ -600,6 +716,7 @@ def run_transcription(
         max_new_tokens=max_new_tokens,
         stats=stats,
     )
+    # tokenizer decode 与 ASR 协议解析留在 CPU，单独统计以免归入 decoder。
     stage_start = time.perf_counter()
     raw = processor.batch_decode(
         [generated_ids],
@@ -623,10 +740,12 @@ def generate(
     max_new_tokens: int,
     stats: TimingStats | None = None,
 ) -> list[int]:
+    # prefill 使用完整 prompt，后续每轮只输入一个 token，并复用 present KV。
     stage_start = time.perf_counter()
     position_ids = position_ids_from_attention(attention_mask)
     add_elapsed(stats, "position_ids", stage_start)
 
+    # 三种 layout 的公开签名不同，但首轮最终都产出同名 logits/present cache。
     feeds = {
         "inputs_embeds": inputs_embeds,
         "position_ids": position_ids,
@@ -647,15 +766,15 @@ def generate(
         raise RuntimeError("prefill decoder session is not loaded")
 
     stage_start = time.perf_counter()
-    init_outputs = prefill_session.run(None, feeds)
+    logits, current_cache = run_decoder(prefill_session, feeds)
     add_elapsed(stats, "decoder_prefill", stage_start)
 
     stage_start = time.perf_counter()
-    current = output_map(prefill_session, init_outputs)
-    next_id = greedy_next_token(current["logits"])
+    next_id = greedy_next_token(logits)
     generated = []
     add_elapsed(stats, "decode_misc", stage_start)
 
+    # next_id 来自上一轮 decoder；遇到 EOS 时不把 EOS 写入最终文本 token 列表。
     for _ in range(max_new_tokens):
         if next_id in EOS_TOKEN_IDS:
             break
@@ -669,6 +788,7 @@ def generate(
         add_elapsed(stats, "decode_token_embed", stage_start)
 
         stage_start = time.perf_counter()
+        # total_seq 每轮增长 1；本轮 position 正好是扩展后 mask 的最后索引。
         attention_mask = np.concatenate([attention_mask, np.ones((1, 1), dtype=np.int64)], axis=1)
         step_pos = np.full((3, 1, 1), attention_mask.shape[1] - 1, dtype=np.int64)
 
@@ -687,22 +807,15 @@ def generate(
         if step_session is None:
             raise RuntimeError("step decoder session is not loaded")
 
-        # ONNX 里没有 Transformers 的 DynamicCache 对象，所以每层输出的
-        # present_key/value 都要在宿主程序里改名后传回下一轮的 past_key/value。
-        for name, value in current.items():
-            if name.startswith("present_key_"):
-                feeds[name.replace("present_", "past_")] = value
-            elif name.startswith("present_value_"):
-                feeds[name.replace("present_", "past_")] = value
         add_elapsed(stats, "decode_misc", stage_start)
 
         stage_start = time.perf_counter()
-        step_outputs = step_session.run(None, feeds)
+        # run_decoder 会把 present_* 自动改名并作为下一轮 past_* 绑定。
+        logits, current_cache = run_decoder(step_session, feeds, current_cache)
         add_elapsed(stats, "decode_decoder", stage_start)
 
         stage_start = time.perf_counter()
-        current = output_map(step_session, step_outputs)
-        next_id = greedy_next_token(current["logits"])
+        next_id = greedy_next_token(logits)
         add_elapsed(stats, "decode_misc", stage_start)
 
     return generated
@@ -720,7 +833,9 @@ def transcribe_onnx(
     decoder_layout: str = "single",
     openvino_device: str = "GPU",
     trt_max_seq_len: int = 1024,
+    directml_device_id: int = 0,
 ):
+    # Python API 与 CLI 共用此入口；调用方无需自行管理 processor/session 生命周期。
     if language:
         language = normalize_language_name(language)
         validate_language(language)
@@ -735,6 +850,7 @@ def transcribe_onnx(
         decoder_layout=decoder_layout,
         openvino_device=openvino_device,
         trt_max_seq_len=trt_max_seq_len,
+        directml_device_id=directml_device_id,
     )
     print(f"ORT providers: {ort.get_available_providers()}")
     print_runtime_providers(graphs)
@@ -763,9 +879,11 @@ def benchmark_onnx(
     decoder_layout: str = "single",
     openvino_device: str = "GPU",
     trt_max_seq_len: int = 1024,
+    directml_device_id: int = 0,
     benchmark_seconds: float = 15.0,
     warmup_runs: int = 1,
 ):
+    # session 创建、模型编译和音频读取都排除在正式 benchmark 之外。
     if language:
         language = normalize_language_name(language)
         validate_language(language)
@@ -778,6 +896,7 @@ def benchmark_onnx(
         decoder_layout=decoder_layout,
         openvino_device=openvino_device,
         trt_max_seq_len=trt_max_seq_len,
+        directml_device_id=directml_device_id,
     )
     print(f"ORT providers: {ort.get_available_providers()}")
     print_runtime_providers(graphs)
@@ -792,6 +911,7 @@ def benchmark_onnx(
 
     print(f"Audio duration: {audio_seconds:.3f} s")
     print(f"Warmup runs: {warmup_runs}")
+    # warmup 触发 EP 的延迟编译、allocator 建立和首次 shape specialization。
     for _ in range(warmup_runs):
         run_transcription(
             processor,
@@ -808,6 +928,8 @@ def benchmark_onnx(
     timing_stats = TimingStats()
     start = time.perf_counter()
     elapsed = 0.0
+    # 只在完整转写之间检查截止时间，所以 wall time 可能超过目标秒数；
+    # runs == 0 保证极慢后端也至少产生一个有效样本。
     while elapsed < benchmark_seconds or runs == 0:
         run_transcription(
             processor,
@@ -831,9 +953,11 @@ def benchmark_onnx(
 
 
 def print_timing_breakdown(stats: TimingStats):
+    # 没有正式样本时不打印百分比，避免 warmup-only 场景出现除零或误导数据。
     if stats.runs <= 0:
         return
 
+    # 固定展示顺序与推理流水线一致，便于直接定位吞吐瓶颈。
     rows = [
         ("prepare_inputs", stats.prepare_inputs),
         ("audio_encoder", stats.audio_encoder),
@@ -858,6 +982,7 @@ def print_timing_breakdown(stats: TimingStats):
 
 
 def main():
+    # benchmark 与单次转写只在最外层分流，底层模型加载和推理实现完全复用。
     args = parse_args()
     if args.benchmark:
         benchmark_onnx(
@@ -872,6 +997,7 @@ def main():
             decoder_layout=args.decoder_layout,
             openvino_device=args.openvino_device,
             trt_max_seq_len=args.trt_max_seq_len,
+            directml_device_id=args.directml_device_id,
             benchmark_seconds=args.benchmark_seconds,
             warmup_runs=args.warmup_runs,
         )
@@ -889,6 +1015,7 @@ def main():
         decoder_layout=args.decoder_layout,
         openvino_device=args.openvino_device,
         trt_max_seq_len=args.trt_max_seq_len,
+        directml_device_id=args.directml_device_id,
     )
     print(f"Language: {language}")
     print(f"Text: {text}")
