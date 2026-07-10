@@ -50,6 +50,7 @@ def add_local_dll_directories():
             [
                 package_root / "openvino" / "libs",
                 package_root / "openvino" / "lib",
+                package_root / "tensorrt_libs",
             ]
         )
 
@@ -110,9 +111,12 @@ def parse_args():
     parser.add_argument("--optimized", action="store_true", help="使用 *.optimized.onnx 模型。")
     parser.add_argument(
         "--decoder-layout",
-        choices=["merged", "split"],
-        default="merged",
-        help="merged 使用 decoder_merged；split 使用 decoder_init + decoder_with_past 做性能对照。",
+        choices=["single", "merged", "split"],
+        default="single",
+        help=(
+            "single 只加载 decoder_with_past 并用空 KV 完成 prefill；"
+            "merged 使用 decoder_merged；split 加载两个 decoder 做性能对照。"
+        ),
     )
     parser.add_argument("--benchmark", action="store_true", help="反复处理同一个音频，输出 warmup 后的吞吐。")
     parser.add_argument("--benchmark-seconds", type=float, default=15.0, help="benchmark 至少运行多少秒。")
@@ -127,6 +131,12 @@ def parse_args():
         "--openvino-device",
         default="GPU",
         help='OpenVINO device_type，例如 "GPU"、"GPU.0"、"CPU"。',
+    )
+    parser.add_argument(
+        "--trt-max-seq-len",
+        type=int,
+        default=1024,
+        help="TensorRT profile 覆盖的最大 prompt + 生成序列长度。",
     )
     return parser.parse_args()
 
@@ -144,6 +154,7 @@ class OnnxGraphs:
     num_layers: int
     num_kv_heads: int
     head_dim: int
+    hidden_size: int
 
 
 @dataclass
@@ -168,7 +179,77 @@ def add_elapsed(stats: TimingStats | None, name: str, start: float):
         setattr(stats, name, getattr(stats, name) + time.perf_counter() - start)
 
 
-def provider_list(provider: str, openvino_device: str = "GPU"):
+def trt_shape_profile(
+    model_stem: str,
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    hidden_size: int,
+    max_seq_len: int,
+) -> dict[str, str]:
+    max_seq_len = max(2, max_seq_len)
+    opt_seq_len = min(256, max_seq_len)
+
+    if model_stem == "token_embed":
+        return {
+            "trt_profile_min_shapes": "input_ids:1x1",
+            "trt_profile_opt_shapes": f"input_ids:1x{opt_seq_len}",
+            "trt_profile_max_shapes": f"input_ids:1x{max_seq_len}",
+        }
+
+    if model_stem == "decoder_init":
+        return {
+            "trt_profile_min_shapes": (
+                f"inputs_embeds:1x1x{hidden_size},position_ids:3x1x1,attention_mask:1x1"
+            ),
+            "trt_profile_opt_shapes": (
+                f"inputs_embeds:1x{opt_seq_len}x{hidden_size},"
+                f"position_ids:3x1x{opt_seq_len},attention_mask:1x{opt_seq_len}"
+            ),
+            "trt_profile_max_shapes": (
+                f"inputs_embeds:1x{max_seq_len}x{hidden_size},"
+                f"position_ids:3x1x{max_seq_len},attention_mask:1x{max_seq_len}"
+            ),
+        }
+
+    if model_stem != "decoder_with_past":
+        return {}
+
+    def decoder_shapes(input_len: int, total_len: int, past_len: int) -> str:
+        shapes = [
+            f"inputs_embeds:1x{input_len}x{hidden_size}",
+            f"position_ids:3x1x{input_len}",
+            f"attention_mask:1x{total_len}",
+        ]
+        for i in range(num_layers):
+            shapes.append(f"past_key_{i}:1x{num_kv_heads}x{past_len}x{head_dim}")
+            shapes.append(f"past_value_{i}:1x{num_kv_heads}x{past_len}x{head_dim}")
+        return ",".join(shapes)
+
+    # ORT's TensorRT EP uses one optimization profile per fused subgraph and
+    # does not switch profiles between prefill and decode. Use one rectangular
+    # range that contains both full-prompt/empty-KV and one-token/growing-KV.
+    # The max point must itself be valid, hence total_len=input_len+past_len.
+    decode_opt_past = min(255, max_seq_len - 1)
+    return {
+        "trt_profile_min_shapes": decoder_shapes(1, 1, 0),
+        "trt_profile_opt_shapes": decoder_shapes(1, decode_opt_past + 1, decode_opt_past),
+        "trt_profile_max_shapes": decoder_shapes(max_seq_len, max_seq_len * 2 - 1, max_seq_len - 1),
+    }
+
+
+def provider_list(
+    provider: str,
+    openvino_device: str = "GPU",
+    *,
+    model_stem: str = "",
+    trt_cache_dir: Path | None = None,
+    trt_max_seq_len: int = 1024,
+    num_layers: int = 0,
+    num_kv_heads: int = 0,
+    head_dim: int = 0,
+    hidden_size: int = 0,
+):
     # auto 优先使用当前环境已注册的 CUDA，其次是 Windows 上的 DirectML，最后回退到 CPU。
     # TensorRT 首次构建 engine 可能很慢，且对动态图支持更挑剔，所以只在显式指定时启用。
     # 这里不会安装 provider，只从 ONNX Runtime 实际能看到的 provider 里选择。
@@ -179,7 +260,33 @@ def provider_list(provider: str, openvino_device: str = "GPU"):
             "CPUExecutionProvider",
         ]
     if provider == "tensorrt" and "TensorrtExecutionProvider" in available:
-        return ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+        if trt_cache_dir is None:
+            raise ValueError("trt_cache_dir is required for TensorRT")
+        trt_cache_dir.mkdir(parents=True, exist_ok=True)
+        trt_options = {
+            "trt_engine_cache_enable": True,
+            "trt_engine_cache_path": str(trt_cache_dir.resolve()),
+            "trt_engine_cache_prefix": "qwen3_asr_lnfp32",
+            "trt_timing_cache_enable": True,
+            "trt_timing_cache_path": str(trt_cache_dir.resolve()),
+            "trt_fp16_enable": True,
+            "trt_layer_norm_fp32_fallback": True,
+        }
+        trt_options.update(
+            trt_shape_profile(
+                model_stem,
+                num_layers,
+                num_kv_heads,
+                head_dim,
+                hidden_size,
+                trt_max_seq_len,
+            )
+        )
+        return [
+            ("TensorrtExecutionProvider", trt_options),
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ]
     if provider == "cuda" and "CUDAExecutionProvider" in available:
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]
     if provider == "directml" and "DmlExecutionProvider" in available:
@@ -192,16 +299,41 @@ def provider_list(provider: str, openvino_device: str = "GPU"):
     return ["CPUExecutionProvider"]
 
 
-def make_session(path: Path, provider: str, openvino_device: str = "GPU") -> ort.InferenceSession:
+def make_session(
+    path: Path,
+    provider: str,
+    openvino_device: str = "GPU",
+    *,
+    trt_cache_dir: Path | None = None,
+    trt_max_seq_len: int = 1024,
+    num_layers: int = 0,
+    num_kv_heads: int = 0,
+    head_dim: int = 0,
+    hidden_size: int = 0,
+) -> ort.InferenceSession:
     options = ort.SessionOptions()
     # prompt 和 KV cache 都会使用动态长度。关闭 memory pattern 可以避免部分
     # execution provider 复用旧 shape 假设导致的问题。
     options.enable_mem_pattern = False
+    model_stem = path.name.split(".", 1)[0]
+    print(f"Loading ONNX session: {path.name} ({provider})", flush=True)
+    started = time.perf_counter()
     session = ort.InferenceSession(
         str(path),
         sess_options=options,
-        providers=provider_list(provider, openvino_device),
+        providers=provider_list(
+            provider,
+            openvino_device,
+            model_stem=model_stem,
+            trt_cache_dir=trt_cache_dir,
+            trt_max_seq_len=trt_max_seq_len,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            hidden_size=hidden_size,
+        ),
     )
+    print(f"Loaded ONNX session: {path.name} in {time.perf_counter() - started:.2f}s", flush=True)
     if provider == "openvino" and "OpenVINOExecutionProvider" not in session.get_providers():
         raise RuntimeError(
             "OpenVINOExecutionProvider was requested but the session fell back to "
@@ -222,7 +354,7 @@ def onnx_name(onnx_dir: Path, stem: str, optimized: bool) -> Path:
     return onnx_dir / f"{stem}{suffix}"
 
 
-def decoder_cache_config(model_dir: str) -> tuple[int, int, int]:
+def decoder_cache_config(model_dir: str) -> tuple[int, int, int, int]:
     # merged decoder 的公开输入包含 past_key/value。首轮 prefill 虽然不使用 past，
     # 但 ORT 仍要求 feed 所有公开输入，所以这里从轻量 config 读取空 KV 的 shape。
     with open(Path(model_dir) / "config.json", "r", encoding="utf-8") as file:
@@ -232,6 +364,7 @@ def decoder_cache_config(model_dir: str) -> tuple[int, int, int]:
         int(text_config["num_hidden_layers"]),
         int(text_config["num_key_value_heads"]),
         int(text_config["head_dim"]),
+        int(text_config["hidden_size"]),
     )
 
 
@@ -242,20 +375,43 @@ def load_graphs(
     provider: str,
     decoder_layout: str,
     openvino_device: str = "GPU",
+    trt_max_seq_len: int = 1024,
 ) -> OnnxGraphs:
     root = Path(onnx_dir)
-    num_layers, num_kv_heads, head_dim = decoder_cache_config(model_dir)
+    num_layers, num_kv_heads, head_dim, hidden_size = decoder_cache_config(model_dir)
     decoder = None
     decoder_init = None
     decoder_with_past = None
+    trt_cache_dir = root / "trt_engine_cache"
+
+    def load(stem: str, session_provider: str | None = None) -> ort.InferenceSession:
+        return make_session(
+            onnx_name(root, stem, optimized),
+            session_provider or provider,
+            openvino_device,
+            trt_cache_dir=trt_cache_dir,
+            trt_max_seq_len=trt_max_seq_len,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            hidden_size=hidden_size,
+        )
+
     if decoder_layout == "merged":
-        decoder = make_session(onnx_name(root, "decoder_merged", optimized), provider, openvino_device)
+        if provider == "tensorrt":
+            raise ValueError("TensorRT does not support decoder_merged.onnx; use --decoder-layout single")
+        decoder = load("decoder_merged")
+    elif decoder_layout == "split":
+        decoder_init = load("decoder_init")
+        decoder_with_past = load("decoder_with_past")
     else:
-        decoder_init = make_session(onnx_name(root, "decoder_init", optimized), provider, openvino_device)
-        decoder_with_past = make_session(onnx_name(root, "decoder_with_past", optimized), provider, openvino_device)
+        decoder_with_past = load("decoder_with_past")
     return OnnxGraphs(
-        token_embed=make_session(onnx_name(root, "token_embed", optimized), provider, openvino_device),
-        audio_encoder=make_session(onnx_name(root, "audio_encoder", optimized), provider, openvino_device),
+        # The supporting graphs are not decode bottlenecks. Keep them on CUDA
+        # to avoid extra TensorRT engines and confine the mixed-precision
+        # TensorRT policy to the memory-dominant decoder.
+        token_embed=load("token_embed", "cuda" if provider == "tensorrt" else None),
+        audio_encoder=load("audio_encoder", "cuda" if provider == "tensorrt" else None),
         decoder=decoder,
         decoder_init=decoder_init,
         decoder_with_past=decoder_with_past,
@@ -263,6 +419,7 @@ def load_graphs(
         num_layers=num_layers,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
+        hidden_size=hidden_size,
     )
 
 
@@ -364,6 +521,7 @@ def load_runtime(
     provider: str,
     decoder_layout: str,
     openvino_device: str = "GPU",
+    trt_max_seq_len: int = 1024,
 ):
     # 模型加载和 session 创建不计入 benchmark；吞吐只统计真正开始送入音频后的耗时。
     processor = Qwen3ASRProcessor.from_pretrained(model_dir, fix_mistral_regex=True)
@@ -374,6 +532,7 @@ def load_runtime(
         provider=provider,
         decoder_layout=decoder_layout,
         openvino_device=openvino_device,
+        trt_max_seq_len=trt_max_seq_len,
     )
     return processor, graphs
 
@@ -392,12 +551,17 @@ def print_runtime_providers(graphs: OnnxGraphs):
             raise RuntimeError("merged decoder session is not loaded")
         print(f"Decoder mode: merged If decoder")
         print(f"Decoder providers: {graphs.decoder.get_providers()}")
-    else:
+    elif graphs.decoder_layout == "split":
         if graphs.decoder_init is None or graphs.decoder_with_past is None:
             raise RuntimeError("split decoder sessions are not loaded")
         print("Decoder mode: split decoder_init + decoder_with_past")
         print(f"Decoder init providers: {graphs.decoder_init.get_providers()}")
         print(f"Decoder step providers: {graphs.decoder_with_past.get_providers()}")
+    else:
+        if graphs.decoder_with_past is None:
+            raise RuntimeError("single decoder session is not loaded")
+        print("Decoder mode: single decoder_with_past")
+        print(f"Decoder providers: {graphs.decoder_with_past.get_providers()}")
 
 
 def run_transcription(
@@ -474,6 +638,9 @@ def generate(
         feeds["use_past"] = np.array(False, dtype=np.bool_)
         add_empty_past_feeds(graphs, feeds)
         prefill_session = graphs.decoder
+    elif graphs.decoder_layout == "single":
+        add_empty_past_feeds(graphs, feeds)
+        prefill_session = graphs.decoder_with_past
     else:
         prefill_session = graphs.decoder_init
     if prefill_session is None:
@@ -550,8 +717,9 @@ def transcribe_onnx(
     max_new_tokens: int = 256,
     optimized: bool = False,
     provider: str = "auto",
-    decoder_layout: str = "merged",
+    decoder_layout: str = "single",
     openvino_device: str = "GPU",
+    trt_max_seq_len: int = 1024,
 ):
     if language:
         language = normalize_language_name(language)
@@ -566,6 +734,7 @@ def transcribe_onnx(
         provider=provider,
         decoder_layout=decoder_layout,
         openvino_device=openvino_device,
+        trt_max_seq_len=trt_max_seq_len,
     )
     print(f"ORT providers: {ort.get_available_providers()}")
     print_runtime_providers(graphs)
@@ -591,8 +760,9 @@ def benchmark_onnx(
     max_new_tokens: int = 256,
     optimized: bool = False,
     provider: str = "auto",
-    decoder_layout: str = "merged",
+    decoder_layout: str = "single",
     openvino_device: str = "GPU",
+    trt_max_seq_len: int = 1024,
     benchmark_seconds: float = 15.0,
     warmup_runs: int = 1,
 ):
@@ -607,6 +777,7 @@ def benchmark_onnx(
         provider=provider,
         decoder_layout=decoder_layout,
         openvino_device=openvino_device,
+        trt_max_seq_len=trt_max_seq_len,
     )
     print(f"ORT providers: {ort.get_available_providers()}")
     print_runtime_providers(graphs)
@@ -700,6 +871,7 @@ def main():
             provider=args.provider,
             decoder_layout=args.decoder_layout,
             openvino_device=args.openvino_device,
+            trt_max_seq_len=args.trt_max_seq_len,
             benchmark_seconds=args.benchmark_seconds,
             warmup_runs=args.warmup_runs,
         )
@@ -716,6 +888,7 @@ def main():
         provider=args.provider,
         decoder_layout=args.decoder_layout,
         openvino_device=args.openvino_device,
+        trt_max_seq_len=args.trt_max_seq_len,
     )
     print(f"Language: {language}")
     print(f"Text: {text}")

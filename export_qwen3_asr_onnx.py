@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument(
         "--keep-decoder-parts",
         action="store_true",
-        help="保留 decoder_init / decoder_with_past，方便和 merged decoder 做性能对照。",
+        help="额外保留 decoder_init，方便和单 decoder / merged decoder 做性能对照。",
     )
     return parser.parse_args()
 
@@ -450,9 +450,8 @@ def main():
     attention_mask = torch.ones((1, args.prefill_len), dtype=torch.long, device=device)
     kv_names = [name for i in range(num_layers) for name in (f"present_key_{i}", f"present_value_{i}")]
     decoder_init_path = out_dir / ("decoder_init.onnx" if args.keep_decoder_parts else "decoder_init.tmp.onnx")
-    decoder_with_past_path = out_dir / (
-        "decoder_with_past.onnx" if args.keep_decoder_parts else "decoder_with_past.tmp.onnx"
-    )
+    # decoder_with_past 同时承担默认运行路径的 prefill 和增量解码，始终保留。
+    decoder_with_past_path = out_dir / "decoder_with_past.onnx"
     decoder_merged_path = out_dir / "decoder_merged.onnx"
     dynamic = {
         "inputs_embeds": {1: "seq"},
@@ -472,7 +471,7 @@ def main():
         dynamic,
     )
 
-    print("[export] decoder_with_past.onnx" if args.keep_decoder_parts else "[export] decoder_with_past.tmp.onnx")
+    print("[export] decoder_with_past.onnx")
     step_embeds = torch.randn((1, 1, hidden_size), dtype=dtype, device=device)
     step_pos = torch.full((3, 1, 1), args.past_len, dtype=torch.long, device=device)
     step_mask = torch.ones((1, args.past_len + 1), dtype=torch.long, device=device)
@@ -538,11 +537,9 @@ def main():
             )
             if not args.keep_decoder_parts:
                 remove_onnx_file_family(optimized_init_path)
-                remove_onnx_file_family(optimized_with_past_path)
 
     if not args.keep_decoder_parts:
         remove_onnx_file_family(decoder_init_path)
-        remove_onnx_file_family(decoder_with_past_path)
 
     print("[done]")
     for path in sorted(path for path in out_dir.glob("*.onnx") if ".tmp" not in path.name):

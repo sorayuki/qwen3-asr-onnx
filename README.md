@@ -1,12 +1,12 @@
 # Qwen3-ASR ONNX Demo
 
-这个项目把本地 `Qwen3-ASR-0.6B` safetensors 模型导出成 ONNX Runtime 可运行的子图，并使用一个 merged decoder：
+这个项目把本地 `Qwen3-ASR-0.6B` safetensors 模型导出成 ONNX Runtime 可运行的子图。默认只加载一个 decoder：
 
 - `token_embed.onnx`
 - `audio_encoder.onnx`
-- `decoder_merged.onnx`
+- `decoder_with_past.onnx`
 
-`decoder_merged.onnx` 内部用 `If(use_past)` 同时保留首轮 prefill 和后续 KV cache 解码路径，但只保存一份 decoder 权重，避免分发两份 decoder。
+`decoder_with_past.onnx` 在 prefill 时接收空 KV cache，后续复用同一个 session 做增量解码。运行时只驻留一份 decoder 权重，也避开了 TensorRT 不支持 `decoder_merged.onnx` 顶层 `If` 的问题。
 
 ## 1. 准备模型目录
 
@@ -78,6 +78,8 @@ uv pip install torch onnx
 onnx_models/
   token_embed.onnx
   audio_encoder.onnx
+  decoder_with_past.onnx
+  decoder_with_past.onnx.data
   decoder_merged.onnx
   decoder_merged.onnx.data
 ```
@@ -90,11 +92,13 @@ onnx_models/
   token_embed.optimized.onnx.data
   audio_encoder.optimized.onnx
   audio_encoder.optimized.onnx.data
+  decoder_with_past.optimized.onnx
+  decoder_with_past.optimized.onnx.data
   decoder_merged.optimized.onnx
   decoder_merged.optimized.onnx.data
 ```
 
-`decoder_init.tmp.onnx` 和 `decoder_with_past.tmp.onnx` 只是导出中间文件，脚本会在合并后清理。
+`decoder_init.tmp.onnx` 只是导出中间文件，脚本会在合并后清理。加 `--keep-decoder-parts` 可额外保留它用于 split 对照。
 
 ## 4. 运行 ONNX Demo
 
@@ -131,7 +135,7 @@ cpu
 ```
 
 Windows + `onnxruntime-directml` 环境通常用 `--provider directml`。
-`--provider tensorrt` 需要本机安装 TensorRT runtime，并确保 `nvinfer_10.dll` 等依赖在 `PATH` 中。
+`--provider tensorrt` 需要 TensorRT 10 runtime。脚本会自动发现 pip 安装的 `tensorrt_libs`，并默认使用单 decoder、动态 shape profile 和磁盘 engine cache。可用 `--trt-max-seq-len` 设置 prompt 加生成长度的上限。
 `--provider openvino` 需要 `onnxruntime-openvino` 和版本匹配的 `openvino` Python 包；脚本会自动把 `.venv\Lib\site-packages\openvino\libs` 加入 DLL 搜索路径，所以不需要手动把 DLL 复制到项目根目录。
 
 ## 5. 性能实测结论
@@ -176,7 +180,7 @@ CPUExecutionProvider
 ```
 
 `onnx_asr_demo.py --provider cuda` 会显式选择 `CUDAExecutionProvider`，不是 TensorRT。
-当前机器尝试 `--provider tensorrt` 时，TensorRT EP 可以挂上，但首次构建/执行耗时很长，暂未得到可用 benchmark 结果；不要把 CUDA fallback 或中途停止的结果记作 TensorRT 成绩。
+TensorRT 使用单 `decoder_with_past` session。`token_embed` 和 `audio_encoder` 保持 CUDA EP，避免不必要的 engine 和数值偏差；decoder 使用 FP16 engine，并对 LayerNorm 启用 FP32 fallback。
 
 | provider | decoder | optimized | 吞吐 | decode decoder |
 |---|---|---:|---:|---:|
@@ -184,6 +188,15 @@ CPUExecutionProvider
 | CUDA | merged | yes | 12.695x | 22.49 ms/token |
 | CUDA | split | no | 13.531x | 20.95 ms/token |
 | CUDA | split | yes | 13.580x | 20.90 ms/token |
+| CUDA | single | no | 13.095x | 21.63 ms/token |
+
+TensorRT 10.16 + ORT 1.27 实测，条件同样为 `asr_en.wav`、`max-new-tokens=256`、warmup 1 次、benchmark 5 秒。profile 上限为 512，engine cache 命中：
+
+| provider | decoder | optimized | 吞吐 | decode decoder |
+|---|---|---:|---:|---:|
+| TensorRT decoder + CUDA support graphs | single | no | 9.028x | 28.91 ms/token |
+
+CUDA single 和 TensorRT single 都在每轮生成 47 token 后遇到 EOS，因此可以直接比较。当前 TensorRT single 慢于 CUDA single；它的主要收益是绕开 merged `If`、只保留一份 decoder 权重并稳定覆盖动态 KV shape，而不是性能领先。生成的 FP16 decoder engine 约 1.20 GB。
 
 ONNX Runtime OpenVINO EP 实测：
 
@@ -205,7 +218,8 @@ ONNX Runtime OpenVINO EP 实测：
 - split 版速度更好，但会保留两份 decoder 权重：`decoder_init` 和 `decoder_with_past`；merged 版只保留一份 decoder 权重，更适合减小分发体积。
 - ONNX 的主要瓶颈仍在逐 token decoder。CUDA EP 下 `decode_decoder` 约 `20.90-22.49 ms/token`；RTX 4090 DirectML 下约 `65.22-71.91 ms/token`；Intel iGPU DirectML 下约 `329.54-333.99 ms/token`。
 - OpenVINO GPU 后端现在可以正常运行；在 Intel iGPU 上总吞吐 `3.41-3.91x`，明显快于 DirectML 跑同一块 iGPU。本轮 OpenVINO 测试里未优化模型反而比 optimized ONNX 快。
-- TensorRT EP 暂未得到有效成绩。
+- TensorRT 必须使用 single decoder；merged `If` 图会被 TensorRT parser 拒绝。不要移除 `trt_layer_norm_fp32_fallback`，否则本机实测会产生重复乱码。
+- 同条件下 TensorRT single 为 `9.028x / 28.91 ms/token`，CUDA single 为 `13.095x / 21.63 ms/token`；当前 TensorRT 路径没有性能优势。
 
 如需导出 split decoder 做对照：
 
